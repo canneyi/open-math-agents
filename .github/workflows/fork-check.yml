@@ -1,0 +1,91 @@
+# Fork-only compile loop. Repeats the steps of check-proof.yml for one file on one ref of this fork, so a proof is
+# checked here before a pull request is opened upstream. Not for upstream: it is started by hand only.
+name: fork-check
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit of this fork, cut from upstream main, that adds the file
+        required: true
+      file:
+        description: proofs/<id>.lean
+        required: true
+      draft:
+        description: Also compile the file without the lint gate (unfinished file, sorry allowed). Never a verdict.
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      FILE: ${{ inputs.file }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - name: Exactly one new file against upstream main
+        run: |
+          set -euo pipefail
+          printf '%s' "$FILE" | grep -Eq "^proofs/[A-Za-z0-9_.'-]+\.lean$"
+          git fetch -q https://github.com/GuillaumeBAUD-coder/open-math-agents main
+          git diff --name-status FETCH_HEAD...HEAD | tee /tmp/diff.txt
+          [ "$(cat /tmp/diff.txt)" = "$(printf 'A\t%s' "$FILE")" ]
+          if git cat-file -e "FETCH_HEAD:$FILE" 2>/dev/null; then echo "already on upstream main: $FILE"; exit 1; fi
+      - name: Lint (before anything compiles)
+        id: lint
+        run: |
+          python3 -I tools/lint.py "$FILE" data/catalog.json > /tmp/lint.json && echo "ok=1" >> "$GITHUB_OUTPUT" || true
+          cat /tmp/lint.json
+      - name: Pinned formal-conjectures
+        if: steps.lint.outputs.ok == '1' || inputs.draft
+        id: fc
+        run: |
+          C=$(python3 -I -c 'import json;print(json.load(open("data/catalog.json"))["meta"]["upstreamCommit"])')
+          echo "commit=$C" >> "$GITHUB_OUTPUT"
+          git init -q "$RUNNER_TEMP/fc" && cd "$RUNNER_TEMP/fc"
+          git remote add origin https://github.com/google-deepmind/formal-conjectures
+          git fetch -q --depth 1 origin "$C" && git checkout -q FETCH_HEAD
+      - uses: actions/cache@v4
+        if: steps.lint.outputs.ok == '1' || inputs.draft
+        id: cache
+        with:
+          path: |
+            ~/.elan
+            ${{ runner.temp }}/fc/.lake
+          key: fc-${{ steps.fc.outputs.commit }}
+      - name: Lean toolchain and Mathlib cache
+        if: steps.lint.outputs.ok == '1' || inputs.draft
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          echo "cache-hit=$CACHE_HIT"
+          retry() { for i in 1 2 3 4; do "$@" && return 0; echo "attempt $i failed: $*"; sleep $((i * 20)); done; return 1; }
+          if ! command -v lake >/dev/null && [ ! -x ~/.elan/bin/lake ]; then
+            retry curl -sSfL --retry 3 https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o /tmp/elan-init.sh
+            retry sh /tmp/elan-init.sh -y --default-toolchain none
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          cd "$RUNNER_TEMP/fc" && retry ~/.elan/bin/lake exe cache get
+      - name: Compile and audit axioms
+        if: steps.lint.outputs.ok == '1'
+        run: OMA_FC="$RUNNER_TEMP/fc" tools/check.sh "$FILE" verdict.json || true
+      - name: Draft compile (no lint gate, never a verdict)
+        if: inputs.draft && steps.lint.outputs.ok != '1'
+        run: |
+          MODULE="$(sed -n 's/^import //p' "$FILE" | head -1)"
+          printf '%s' "$MODULE" | grep -Eq '^[A-Za-z0-9_.]+$'
+          cp "$FILE" "$RUNNER_TEMP/fc/OMADraft.lean"
+          cd "$RUNNER_TEMP/fc"
+          timeout 2400 lake build "$MODULE" 2>&1 | tail -20
+          timeout 1800 lake env lean OMADraft.lean 2>&1 | tee /tmp/draft.log | head -c 60000 || true
+          echo "---- draft summary ----"
+          echo "errors: $(grep -cE ':[0-9]+:[0-9]+: error' /tmp/draft.log)  sorries: $(grep -c 'declaration uses .sorry.' /tmp/draft.log)"
+      - name: Verdict
+        if: ${{ !cancelled() }}
+        run: |
+          [ -f verdict.json ] || echo '{"verdict":"none","reason":"checker produced no verdict (lint failed, draft run, or setup fault)"}' > verdict.json
+          python3 -I -c 'import json;d=json.load(open("verdict.json"));log=d.pop("log","");print(json.dumps(d,indent=1,ensure_ascii=False));print("---- log ----");print(log)'
