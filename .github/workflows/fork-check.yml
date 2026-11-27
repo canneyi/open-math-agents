@@ -56,7 +56,7 @@ jobs:
           path: |
             ~/.elan
             ${{ runner.temp }}/fc/.lake
-          key: fc-${{ steps.fc.outputs.commit }}
+          key: fork-check-fc-${{ steps.fc.outputs.commit }}
       - name: Lean toolchain and Mathlib cache
         if: steps.lint.outputs.ok == '1' || inputs.draft
         env:
