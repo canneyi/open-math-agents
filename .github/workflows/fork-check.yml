@@ -27,22 +27,34 @@ jobs:
     env:
       FILE: ${{ inputs.file }}
     steps:
+      # Only this ref, without history, and only what the checks read: the diff below asks the GitHub API, and
+      # proofs/ (10,000 files, 540 MB) is left out except for the submitted file.
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-          fetch-depth: 0
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /tools/
+            /data/
+            /statements/
+            /reductions/
+            /${{ inputs.file }}
       - name: Only the expected new files against upstream main
         env:
           WITH_STATEMENT: ${{ inputs.statement }}
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: lefttosolve2/open-math-agents
         run: |
           set -euo pipefail
           printf '%s' "$FILE" | grep -Eq "^proofs/[A-Za-z0-9_.'-]+\.lean$"
-          git fetch -q https://github.com/GuillaumeBAUD-coder/open-math-agents main
-          git diff --name-status FETCH_HEAD...HEAD | tee /tmp/diff.txt
+          # Same three-dot diff as `git diff FETCH_HEAD...HEAD`, computed by GitHub from the merge base.
+          gh api "repos/$UPSTREAM/compare/main...$GITHUB_REPOSITORY_OWNER:$(git rev-parse HEAD)" \
+            --jq '.files[] | [(.status | if . == "added" then "A" else . end), .filename] | @tsv' | tee /tmp/diff.txt
           EXPECT="$(printf 'A\t%s' "$FILE")"
           if [ "$WITH_STATEMENT" = "true" ]; then EXPECT="$(printf 'A\t%s\nA\tstatements/%s' "$FILE" "${FILE#proofs/}")"; fi
           [ "$(cat /tmp/diff.txt)" = "$EXPECT" ]
-          if git cat-file -e "FETCH_HEAD:$FILE" 2>/dev/null; then echo "already on upstream main: $FILE"; exit 1; fi
+          if gh api "repos/$UPSTREAM/contents/$FILE?ref=main" --silent 2>/dev/null; then echo "already on upstream main: $FILE"; exit 1; fi
       - name: Lint (before anything compiles)
         id: lint
         run: |
@@ -77,10 +89,40 @@ jobs:
             retry sh /tmp/elan-init.sh -y --default-toolchain none
           fi
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          cd "$RUNNER_TEMP/fc" && retry ~/.elan/bin/lake exe cache get
+          # A restored cache was saved after `lake exe cache get`, so it already holds Mathlib's build.
+          if [ "$CACHE_HIT" = "true" ] && [ -d "$RUNNER_TEMP/fc/.lake/packages/mathlib/.lake/build/lib" ]; then
+            echo "Mathlib build restored from the cache: skipping lake exe cache get"
+          else
+            cd "$RUNNER_TEMP/fc" && retry ~/.elan/bin/lake exe cache get
+          fi
       - name: Compile and audit axioms
         if: steps.lint.outputs.ok == '1'
-        run: OMA_FC="$RUNNER_TEMP/fc" tools/check.sh "$FILE" verdict.json || true
+        run: |
+          T0=$(date +%s)
+          # tools/check.sh copies every statement and reduction with three processes per file (13,000 files).
+          # Here one python process writes the same files, and check.sh runs from a copy of the tree that has no
+          # statements/ or reductions/ directory, so it skips its own copy loops and does everything else unchanged.
+          SH="$RUNNER_TEMP/root"; mkdir -p "$SH/proofs"
+          cp -r tools data "$SH/"; cp "$FILE" "$SH/$FILE"
+          python3 -I - "$PWD" "$RUNNER_TEMP/fc" <<'PY'
+          import os, re, shutil, sys
+          root, fc = sys.argv[1], sys.argv[2]
+          for d, lib, pre in (("reductions", "OMAReductions", "R_"), ("statements", "OMAStatements", "S_")):
+              src = os.path.join(root, d)
+              if not os.path.isdir(src):
+                  continue
+              dst = os.path.join(fc, lib)
+              os.makedirs(dst, exist_ok=True)
+              for n in sorted(os.listdir(src)):
+                  if n.endswith(".lean"):
+                      shutil.copyfile(os.path.join(src, n), os.path.join(dst, pre + re.sub(r"[^A-Za-z0-9]", "_", n[:-5]) + ".lean"))
+              lf = os.path.join(fc, "lakefile.toml")
+              if ('name = "%s"' % lib) not in open(lf).read():
+                  open(lf, "a").write('\n[[lean_lib]]\nname = "%s"\nglobs = ["%s.+"]\n' % (lib, lib))
+          PY
+          echo "prepared in $(( $(date +%s) - T0 )) s"
+          OMA_FC="$RUNNER_TEMP/fc" "$SH/tools/check.sh" "$FILE" verdict.json || true
+          echo "checked in $(( $(date +%s) - T0 )) s"
       - name: Draft compile (no lint gate, never a verdict)
         if: inputs.draft && steps.lint.outputs.ok != '1'
         run: |
